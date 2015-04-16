@@ -102,9 +102,7 @@ void *cas_create_server_config(apr_pool_t *pool, server_rec *svr)
 	c->merged = FALSE;
 	c->CASVersion = CAS_DEFAULT_VERSION;
 	c->CASDebug = CAS_DEFAULT_DEBUG;
-	c->CASValidateServer = CAS_DEFAULT_VALIDATE_SERVER;
 	c->CASValidateDepth = CAS_DEFAULT_VALIDATE_DEPTH;
-	c->CASAllowWildcardCert = CAS_DEFAULT_ALLOW_WILDCARD_CERT;
 	c->CASCertificatePath = CAS_DEFAULT_CA_PATH;
 	c->CASCookiePath = CAS_DEFAULT_COOKIE_PATH;
 	c->CASCookieEntropy = CAS_DEFAULT_COOKIE_ENTROPY;
@@ -138,9 +136,7 @@ void *cas_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD)
 	c->merged = TRUE;
 	c->CASVersion = (add->CASVersion != CAS_DEFAULT_VERSION ? add->CASVersion : base->CASVersion);
 	c->CASDebug = (add->CASDebug != CAS_DEFAULT_DEBUG ? add->CASDebug : base->CASDebug);
-	c->CASValidateServer = (add->CASValidateServer != CAS_DEFAULT_VALIDATE_SERVER ? add->CASValidateServer : base->CASValidateServer);
 	c->CASValidateDepth = (add->CASValidateDepth != CAS_DEFAULT_VALIDATE_DEPTH ? add->CASValidateDepth : base->CASValidateDepth);
-	c->CASAllowWildcardCert = (add->CASAllowWildcardCert != CAS_DEFAULT_ALLOW_WILDCARD_CERT ? add->CASAllowWildcardCert : base->CASAllowWildcardCert);
 	c->CASCertificatePath = (apr_strnatcasecmp(add->CASCertificatePath,CAS_DEFAULT_CA_PATH) != 0 ? add->CASCertificatePath : base->CASCertificatePath);
 	c->CASCookiePath = (apr_strnatcasecmp(add->CASCookiePath, CAS_DEFAULT_COOKIE_PATH) != 0 ? add->CASCookiePath : base->CASCookiePath);
 	c->CASCookieEntropy = (add->CASCookieEntropy != CAS_DEFAULT_COOKIE_ENTROPY ? add->CASCookieEntropy : base->CASCookieEntropy);
@@ -263,15 +259,6 @@ const char *cfg_readCASParameter(cmd_parms *cmd, void *cfg, const char *value)
 			else
 				return(apr_psprintf(cmd->pool, "MOD_AUTH_CAS: Invalid argument to CASDebug - must be 'On' or 'Off'"));
 		break;
-		case cmd_validate_server:
-			/* if atoi() is used on value here with AP_INIT_FLAG, it works but results in a compile warning, so we use TAKE1 to avoid it */
-			if(apr_strnatcasecmp(value, "On") == 0)
-				c->CASValidateServer = TRUE;
-			else if(apr_strnatcasecmp(value, "Off") == 0)
-				c->CASValidateServer = FALSE;
-			else
-				return(apr_psprintf(cmd->pool, "MOD_AUTH_CAS: Invalid argument to CASValidateServer - must be 'On' or 'Off'"));
-		break;
 		case cmd_validate_saml:
 			if(apr_strnatcasecmp(value, "On") == 0)
 				c->CASValidateSAML = TRUE;
@@ -286,17 +273,6 @@ const char *cfg_readCASParameter(cmd_parms *cmd, void *cfg, const char *value)
 		case cmd_attribute_prefix:
 			c->CASAttributePrefix = apr_pstrdup(cmd->pool, value);
 		break;
-		case cmd_wildcard_cert:
-			// XXX this feature is broken now
-			/* if atoi() is used on value here with AP_INIT_FLAG, it works but results in a compile warning, so we use TAKE1 to avoid it */
-			if(apr_strnatcasecmp(value, "On") == 0)
-				c->CASAllowWildcardCert = TRUE;
-			else if(apr_strnatcasecmp(value, "Off") == 0)
-				c->CASAllowWildcardCert = FALSE;
-			else
-				return(apr_psprintf(cmd->pool, "MOD_AUTH_CAS: Invalid argument to CASAllowWildcardCert - must be 'On' or 'Off'"));
-		break;
-
 		case cmd_ca_path:
 			if(apr_stat(&f, value, APR_FINFO_TYPE, cmd->temp_pool) == APR_INCOMPLETE)
 				return(apr_psprintf(cmd->pool, "MOD_AUTH_CAS: Could not find Certificate Authority file '%s'", value));
@@ -773,10 +749,11 @@ char *getCASCookie(request_rec *r, char *cookieName)
 	return rv;
 }
 
-void setCASCookie(request_rec *r, char *cookieName, char *cookieValue, apr_byte_t secure)
+void setCASCookie(request_rec *r, char *cookieName, char *cookieValue, apr_byte_t secure, apr_time_t expireTime)
 {
-	char *headerString, *currentCookies, *pathPrefix = "";
+	char *headerString, *currentCookies, *pathPrefix = "", *expireTimeString = NULL, *errString, *domainString = "";
 	cas_cfg *c = ap_get_module_config(r->server->module_config, &auth_cas_module);
+	apr_status_t retVal;
 
 	if(c->CASDebug)
 		ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "entering setCASCookie()");
@@ -784,7 +761,27 @@ void setCASCookie(request_rec *r, char *cookieName, char *cookieValue, apr_byte_
 	if(c->CASRootProxiedAs.is_initialized)
 		pathPrefix = urlEncode(r, c->CASRootProxiedAs.path, " ");
 
-	headerString = apr_psprintf(r->pool, "%s=%s%s;Path=%s%s%s%s%s", cookieName, cookieValue, (secure ? ";Secure" : ""), pathPrefix, urlEncode(r, getCASScope(r), " "), (c->CASCookieDomain != NULL ? ";Domain=" : ""), (c->CASCookieDomain != NULL ? c->CASCookieDomain : ""), (c->CASCookieHttpOnly != FALSE ? "; HttpOnly" : ""));
+	if(CAS_SESSION_EXPIRE_SESSION_SCOPE_TIMEOUT != expireTime) {
+		expireTimeString = (char *)apr_pcalloc(r->pool, APR_RFC822_DATE_LEN);
+		retVal = apr_rfc822_date(expireTimeString, expireTime);
+		if(APR_SUCCESS != retVal) {
+			errString = (char *)apr_pcalloc(r->pool, CAS_MAX_ERROR_SIZE);
+			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Problem setting cookie expiry date: %s", apr_strerror(retVal, errString, CAS_MAX_ERROR_SIZE));
+		}
+	}
+
+	if(NULL != c->CASCookieDomain) {
+		domainString = apr_psprintf(r->pool, ";Domain=%s", c->CASCookieDomain);
+	}
+	headerString = apr_psprintf(r->pool, "%s=%s%s;Path=%s%s%s%s%s",
+		cookieName,
+		cookieValue,
+		(secure ? ";Secure" : ""),
+		pathPrefix,
+		urlEncode(r, getCASScope(r), " "),
+		(c->CASCookieDomain != NULL ? domainString : ""),
+		(c->CASCookieHttpOnly != FALSE ? "; HttpOnly" : ""),
+		(NULL == expireTimeString) ? "" : apr_psprintf(r->pool, "; expires=%s", expireTimeString));
 
 	/* use r->err_headers_out so we always print our headers (even on 302 redirect) - headers_out only prints on 2xx responses */
 	apr_table_add(r->err_headers_out, "Set-Cookie", headerString);
@@ -1710,8 +1707,7 @@ CURLcode cas_curl_ssl_ctx(CURL *curl, void *sslctx, void *parm)
 	SSL_CTX *ctx = (SSL_CTX *) sslctx;
 	cas_cfg *c = (cas_cfg *)parm;
 
-	if(c->CASValidateServer != FALSE)
-		SSL_CTX_set_verify_depth(ctx, c->CASValidateDepth);
+	SSL_CTX_set_verify_depth(ctx, c->CASValidateDepth);
 
 	return CURLE_OK;
 }
@@ -1758,7 +1754,7 @@ char *getResponseFromServer (request_rec *r, cas_cfg *c, char *ticket)
 	curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP|CURLPROTO_HTTPS);
 #endif
 
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, (c->CASValidateServer != FALSE ? 1L : 0L));
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 
 	if(apr_stat(&f, c->CASCertificatePath, APR_FINFO_TYPE, r->pool) == APR_INCOMPLETE) {
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "MOD_AUTH_CAS: Could not load CA certificate: %s", c->CASCertificatePath);
@@ -1773,8 +1769,7 @@ char *getResponseFromServer (request_rec *r, cas_cfg *c, char *ticket)
 		goto out;
 	}
 
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, (c->CASValidateServer != FALSE ? 2L : 0L));
-
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "mod_auth_cas 1.0.10");
 
 	if(c->CASValidateSAML == TRUE) {
@@ -2045,7 +2040,7 @@ int cas_authenticate(request_rec *r)
 		if(cookieString == NULL) { /* they have not made a gateway trip yet */
 			if(c->CASDebug)
 				ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Gateway initial access (%s)", r->parsed_uri.path);
-			setCASCookie(r, d->CASGatewayCookie, "TRUE", ssl);
+			setCASCookie(r, d->CASGatewayCookie, "TRUE", ssl, CAS_SESSION_EXPIRE_SESSION_SCOPE_TIMEOUT);
 			redirectRequest(r, c);
 			return HTTP_MOVED_TEMPORARILY;
 		} else {
@@ -2065,7 +2060,11 @@ int cas_authenticate(request_rec *r)
 			if(cookieString == NULL)
 				return HTTP_INTERNAL_SERVER_ERROR;
 
-			setCASCookie(r, (ssl ? d->CASSecureCookie : d->CASCookie), cookieString, ssl);
+			setCASCookie(r, (ssl ? d->CASSecureCookie : d->CASCookie), cookieString, ssl, CAS_SESSION_EXPIRE_SESSION_SCOPE_TIMEOUT);
+			/* remove gateway cookie so they can reauthenticate later */
+			if (getCASCookie(r, d->CASGatewayCookie)) {
+				setCASCookie(r, d->CASGatewayCookie, "TRUE", ssl, CAS_SESSION_EXPIRE_COOKIE_NOW);
+			}
 			r->user = remoteUser;
 			if(d->CASAuthNHeader != NULL)
 				apr_table_set(r->headers_in, d->CASAuthNHeader, remoteUser);
@@ -2160,6 +2159,7 @@ int cas_authenticate(request_rec *r)
 		} else {
 			/* maybe the cookie expired, have the user get a new service ticket */
 			redirectRequest(r, c);
+			setCASCookie(r, (ssl ? d->CASSecureCookie : d->CASCookie), "", ssl, CAS_SESSION_EXPIRE_COOKIE_NOW);
 			return HTTP_MOVED_TEMPORARILY;
 		}
 	}
@@ -2672,9 +2672,7 @@ const command_rec cas_cmds [] = {
 	AP_INIT_TAKE1("CASAttributePrefix", cfg_readCASParameter, (void *) cmd_attribute_prefix, RSRC_CONF, "The prefix to use when setting attributes in the HTTP headers"),
 
 	/* ssl related options */
-	AP_INIT_TAKE1("CASValidateServer", cfg_readCASParameter, (void *) cmd_validate_server, RSRC_CONF, "Require validation of CAS server SSL certificate for successful authentication (On or Off)"),
 	AP_INIT_TAKE1("CASValidateDepth", cfg_readCASParameter, (void *) cmd_validate_depth, RSRC_CONF, "Define the number of chained certificates required for a successful validation"),
-	AP_INIT_TAKE1("CASAllowWildcardCert", cfg_readCASParameter, (void *) cmd_wildcard_cert, RSRC_CONF, "Allow wildcards in certificates when performing validation (e.g. *.example.com) (On or Off)"),
 	AP_INIT_TAKE1("CASCertificatePath", cfg_readCASParameter, (void *) cmd_ca_path, RSRC_CONF, "Path to the X509 certificate for the CASServer Certificate Authority"),
 
 	/* pertinent CAS urls */
